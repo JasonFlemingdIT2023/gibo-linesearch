@@ -1,0 +1,43 @@
+name: gibo_argmax_detEI
+description: "Constrained detEI config"
+
+dimensions: [4, 8, 12, 16, 20, 24, 28, 32, 36]
+n_runs: 40
+seed_start: 0
+max_objective_calls: 300
+
+noise_variance: 0.01
+gp_hypers:
+  outputscale: 1.0
+factor_lengthscale: 2
+
+inner_loop_mode: ei_detwolfe
+
+c1: 0.05
+c2: 0.5                     
+c_W: 0.3
+
+alpha_min_factor: 0.1
+alpha_max_factor: 0.3
+
+sigma_floor: 0.1
+
+budget: 300
+
+max_samples_per_iteration: 2
+acqf_num_restarts: 5
+acqf_raw_samples: 64
+delta: 0.3
+
+N_max: variable
+optimize_hyperparameters: false
+no_noise_optimization: false
+
+lr: 0.25
+lr_schedular: null
+normalize_gradient: true
+standard_deviation_scaling: false
+epsilon_diff_acq_value: null
+
+results_dir: experiments/thesis_experiments/results
+verbose: false

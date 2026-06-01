@@ -13,6 +13,10 @@ from src.environment_api import EnvironmentObjective
 from src.acquisition_function import GradientInformation
 from src.model import ExactGPSEModel, DerivativeExactGPSEModel
 
+from src.line_search.utils import get_search_direction, eval_phi_0
+from src.line_search.constrained_search import find_alpha_constrained
+
+
 
 class AbstractOptimizer(ABC):
     """Abstract optimizer class.
@@ -500,31 +504,35 @@ class BayesianGradientAscent(AbstractOptimizer):
 
     def __init__(
         self,
-        params_init: torch.Tensor,
-        objective: Union[Callable[[torch.Tensor], torch.Tensor], EnvironmentObjective],
-        max_samples_per_iteration: int,
-        OptimizerTorch: torch.optim.Optimizer,
-        optimizer_torch_config: Optional[Dict],
-        lr_schedular: Optional[Dict[int, int]],
-        Model: DerivativeExactGPSEModel,
-        model_config: Optional[
-            Dict[
-                str,
-                Union[int, float, torch.nn.Module, gpytorch.priors.Prior],
-            ]
-        ],
-        hyperparameter_config: Optional[Dict[str, bool]],
-        optimize_acqf: Callable[[GradientInformation, torch.Tensor], torch.Tensor],
-        optimize_acqf_config: Dict[str, Union[torch.Tensor, int, float]],
-        bounds: Optional[torch.Tensor],
-        delta: Optional[Union[int, float]],
-        epsilon_diff_acq_value: Optional[Union[int, float]],
-        generate_initial_data: Optional[
-            Callable[[Callable[[torch.Tensor], torch.Tensor]], torch.Tensor]
-        ],
-        normalize_gradient: bool = False,
-        standard_deviation_scaling: bool = False,
-        verbose: bool = True,
+        params_init,
+        objective,
+        max_samples_per_iteration,
+        OptimizerTorch,
+        optimizer_torch_config,
+        lr_schedular,
+        Model,
+        model_config,
+        hyperparameter_config,
+        optimize_acqf,
+        optimize_acqf_config,
+        bounds,
+        delta,
+        epsilon_diff_acq_value,
+        generate_initial_data,
+        normalize_gradient = False,
+        standard_deviation_scaling = False,
+        verbose = True,
+    
+        # Constrained while-loop parameters
+        inner_loop_mode: str = 'original',
+        c1: float = 0.05,                    
+        c2: float = 0.5,                     
+        c_W: float = 0.3,                    
+        sigma_floor: float = 0.1,            
+        alpha_min_factor: float = 0.1,       
+        alpha_max_factor: float = None,                    
+        budget: int = 300,           
+        
     ) -> None:
         """Inits optimizer Bayesian gradient ascent."""
         super(BayesianGradientAscent, self).__init__(params_init, objective)
@@ -585,11 +593,31 @@ class BayesianGradientAscent(AbstractOptimizer):
 
         self.max_samples_per_iteration = max_samples_per_iteration
         self.verbose = verbose
+        
+        # Thesis Vars 
+        self.inner_loop_mode = inner_loop_mode
+        self.c1 = c1
+        self.c2 = c2
+        self.c_W = c_W
+        self.sigma_floor = sigma_floor
+        self.alpha_min_factor = alpha_min_factor
+        self.alpha_max_factor = alpha_max_factor  
+        self.budget = budget
+        
+        # cumulative eval count across step(), because only step
+        self.eval_count = 0  
+        # Diagnostics from last step() call fro runner
+        self.last_step_info: dict = {}
+
 
     def step(self) -> None:
         # Sample with new params from objective and add this to train data.
         # Optionally forget old points (if N > N_max).
         f_params = self.objective(self.params)
+ 
+        # Description: Track cumulative real f-evals for while-loop budget guard
+        self.eval_count += 1
+
         if self.verbose:
             print(f"Reward of parameters theta_(t-1): {f_params.item():.2f}.")
         self.model.append_train_data(self.params, f_params)
@@ -621,56 +649,224 @@ class BayesianGradientAscent(AbstractOptimizer):
                 self.params
             )  # Call this to update prediction strategy of GPyTorch.
 
-        acq_value_old = None
-        for i in range(self.max_samples_per_iteration):
-            # Optimize acquistion function and get new observation.
-            new_x, acq_value = self.optimize_acqf(self.acquisition_fcn, self.bounds)
-            new_y = self.objective(new_x)
+        # branches for thesis extensions
+        if self.inner_loop_mode == 'original':
+            acq_value_old = None
+            n_inner = 0 # count for samples
+            for i in range(self.max_samples_per_iteration):
+                # Optimize acquistion function and get new observation.
+                new_x, acq_value = self.optimize_acqf(self.acquisition_fcn, self.bounds)
+                new_y = self.objective(new_x)
 
-            # Update training points.
-            self.model.append_train_data(new_x, new_y)
+                # Update training points.
+                self.model.append_train_data(new_x, new_y)
 
-            if (
-                type(self.objective._func) is EnvironmentObjective
-                and self.objective._func._manipulate_state is not None
-                and self.objective._func._manipulate_state.apply_update() is not None
-            ):
-                self.objective._func._manipulate_state.apply_update()
+                if (
+                    type(self.objective._func) is EnvironmentObjective
+                    and self.objective._func._manipulate_state is not None
+                    and self.objective._func._manipulate_state.apply_update() is not None
+                ):
+                    self.objective._func._manipulate_state.apply_update()
 
-            self.model.posterior(self.params)
-            self.acquisition_fcn.update_K_xX_dx()
+                self.model.posterior(self.params)
+                self.acquisition_fcn.update_K_xX_dx()
+                n_inner += 1 # 
 
-            # Stop sampling if differece of values of acquired points is smaller than a threshold.
-            # Equivalent to: variance of gradient did not change larger than a threshold.
-            if self.epsilon_diff_acq_value is not None:
-                if acq_value_old is not None:
-                    diff = acq_value - acq_value_old
-                    if diff < self.epsilon_diff_acq_value:
-                        if self.verbose:
-                            print(
-                                f"Stop sampling after {i+1} samples, since gradient certainty is {diff}."
-                            )
-                        break
-                acq_value_old = acq_value
+                # Stop sampling if differece of values of acquired points is smaller than a threshold.
+                # Equivalent to: variance of gradient did not change larger than a threshold.
+                if self.epsilon_diff_acq_value is not None:
+                    if acq_value_old is not None:
+                        diff = acq_value - acq_value_old
+                        if diff < self.epsilon_diff_acq_value:
+                            if self.verbose:
+                                print(
+                                    f"Stop sampling after {i+1} samples, since gradient certainty is {diff}."
+                                )
+                            break
+                    acq_value_old = acq_value
+           
 
-        with torch.no_grad():
-            self.optimizer_torch.zero_grad()
-            mean_d, variance_d = self.model.posterior_derivative(self.params)
-            params_grad = -mean_d.view(1, self.D)
-            if self.normalize_gradient:
-                lengthscale = self.model.covar_module.base_kernel.lengthscale.detach()
-                params_grad = torch.nn.functional.normalize(params_grad) * lengthscale
-            if self.standard_deviation_scaling:
-                params_grad = params_grad / torch.diag(variance_d.view(self.D, self.D))
-            if self.lr_schedular:
-                lr = [v for k, v in self.lr_schedular.items() if k <= self.iteration][
-                    -1
-                ]
-                self.params.grad[:] = lr * params_grad  # Define as gradient ascent.
+
+        
+        # while-loop --> stepping is the default, sampling only when constrained argmax returns None.
+        elif self.inner_loop_mode in ('argmax_pwolfe', 'argmax_detwolfe', 'ei_detwolfe'):
+
+            with torch.no_grad():
+                ls = self.model.covar_module.base_kernel.lengthscale.detach().mean().item()
+            alpha_min = self.alpha_min_factor * ls
+            
+            if self.alpha_max_factor is not None:
+               alpha_max = self.alpha_max_factor * ls
+            elif self.delta is not None:
+               alpha_max = float(self.delta)
             else:
-                self.params.grad[:] = params_grad  # Define as gradient ascent.
-            self.optimizer_torch.step()
+               alpha_max = 2.0 * ls # 13% correlation range
+               
+            #metric accumulators
+            alpha_history = []
+            pwolfe_history = []
+            armijo_history = []
+            curvature_history = []
+            ei_value_history = [] 
+            n_gi_samples = 0
+            n_steps = 0
+            n_consecutive_fails = 0
+            step_trigger = 'budget'
+            theta_trajectory = [(self.params.clone(), self.eval_count)]
+
+            while self.eval_count < self.budget:
+
+                for _ in range(self.max_samples_per_iteration):
+                    if self.eval_count >= self.budget:
+                        break
+                    new_x, _ = self.optimize_acqf(self.acquisition_fcn, self.bounds)
+                    new_y = self.objective(new_x)
+                    self.eval_count += 1
+                    n_gi_samples += 1
+                    self.model.append_train_data(new_x, new_y)
+                    self.model.posterior(self.params)
+                    self.acquisition_fcn.update_K_xX_dx()
+                    theta_trajectory.append((self.params.clone(), self.eval_count))
+
+                while True:
+                    p_direction, _ = get_search_direction(self.model, self.params)
+                    phi_0, phi_d_0, _ = eval_phi_0(self.model, self.params, p_direction)
+
+                    alpha_star, cached_wolfe = find_alpha_constrained(
+                        self.model, self.params, p_direction,
+                        phi_0=phi_0, phi_d_0=phi_d_0,
+                        alpha_min=alpha_min, alpha_max=alpha_max,
+                        mode=self.inner_loop_mode,
+                        c1=self.c1, c2=self.c2,
+                        c_W=self.c_W, sigma_floor=self.sigma_floor,
+                    )
+
+                    if alpha_star is None:
+                        n_consecutive_fails += 1
+                        step_trigger = 'wolfe_empty'
+                        break
+
+                    alpha_history.append(alpha_star)
+                    if self.inner_loop_mode == 'argmax_pwolfe':
+                        pwolfe_history.append(cached_wolfe)
+                    if self.inner_loop_mode in ('argmax_detwolfe', 'ei_detwolfe'):
+                        armijo, curvature = cached_wolfe
+                        armijo_history.append(armijo)
+                        curvature_history.append(curvature)
+                    if self.inner_loop_mode == 'ei_detwolfe':
+                        from src.line_search.det_ei import compute_ei
+                        ei_value_history.append(
+                            compute_ei(self.model, self.params, alpha_star, p_direction, eta=phi_0)
+                        )
+
+                    with torch.no_grad():
+                        self.params.data += alpha_star * p_direction
+                    n_steps += 1
+                    n_consecutive_fails = 0
+                    step_trigger = 'wolfe_ok'
+
+                    self.acquisition_fcn.update_theta_i(self.params)
+                    if self.update_bounds:
+                        self.bounds = torch.tensor([[-self.delta], [self.delta]]) + self.params
+
+                    if self.verbose:
+                        print(
+                            f"[{self.inner_loop_mode}] step {n_steps}: "
+                            f"alpha={alpha_star:.4f}, eval_count={self.eval_count}"
+                        )
+
+
+                if n_consecutive_fails >= 2:
+                    alpha_fallback = 0.25 * ls
+                    with torch.no_grad():
+                        self.params.data += alpha_fallback * p_direction
+                    alpha_history.append(alpha_fallback)
+                    n_steps += 1
+                    n_consecutive_fails = 0
+                    step_trigger = 'fallback_baseline'  
+
+                    self.acquisition_fcn.update_theta_i(self.params)
+                    if self.update_bounds:
+                        self.bounds = torch.tensor([[-self.delta], [self.delta]]) + self.params
+
+
+            self.while_loop_info = {
+                'n_gi_samples_this_iter': n_gi_samples,
+                'n_steps_this_iter': n_steps,
+                'alpha_history': alpha_history,
+                'step_trigger': step_trigger,
+                'phi_0': phi_0.item() if hasattr(phi_0, 'item') else float(phi_0),
+                'grad_norm_at_entry': phi_d_0.item() if hasattr(phi_d_0, 'item') else float(phi_d_0),
+                'p_wolfe_history': pwolfe_history or None,
+                'armijo_history': armijo_history or None,
+                'curvature_history': curvature_history or None,
+                'ei_value_history': ei_value_history or None,  
+                'theta_trajectory': theta_trajectory,
+            }
+
+
+        
+        # thesis branch for step
+        if self.inner_loop_mode == 'original':
+            
+            with torch.no_grad():
+                self.optimizer_torch.zero_grad()
+                mean_d, variance_d = self.model.posterior_derivative(self.params)
+                params_grad = -mean_d.view(1, self.D)
+                if self.normalize_gradient:
+                    lengthscale = self.model.covar_module.base_kernel.lengthscale.detach()
+                    params_grad = torch.nn.functional.normalize(params_grad) * lengthscale
+                if self.standard_deviation_scaling:
+                    params_grad = params_grad / torch.diag(variance_d.view(self.D, self.D))
+                if self.lr_schedular:
+                    lr = [v for k, v in self.lr_schedular.items() if k <= self.iteration][
+                        -1
+                    ]
+                    self.params.grad[:] = lr * params_grad  # Define as gradient ascent.
+                else:
+                    self.params.grad[:] = params_grad  # Define as gradient ascent.
+                self.optimizer_torch.step()
+                self.iteration += 1
+
+        elif self.inner_loop_mode in ('argmax_pwolfe', 'argmax_detwolfe', 'ei_detwolfe'):
             self.iteration += 1
+
+
+        # collect while-loop info metrics for runner
+        with torch.no_grad():
+            post = self.model.posterior(self.params)
+            sigma2 = post.mvn.variance.squeeze().item()
+            mean_d, _ = self.model.posterior_derivative(self.params)
+            grad_norm = mean_d.norm().item()
+
+        if self.inner_loop_mode == 'original':
+            self.last_step_info = {
+                'mode': 'original',
+                'n_inner_samples': n_inner,
+                'alpha': None,
+                'grad_norm': grad_norm,
+                'sigma2': sigma2,
+            }
+        elif self.inner_loop_mode in ('argmax_pwolfe', 'argmax_detwolfe', 'ei_detwolfe'):
+            info = self.while_loop_info
+            self.last_step_info = {
+                'mode': self.inner_loop_mode,
+                'n_gi_samples_this_iter': info['n_gi_samples_this_iter'],
+                'n_steps_this_iter': info['n_steps_this_iter'],
+                'alpha_history': info['alpha_history'],
+                'step_trigger': info['step_trigger'],
+                'phi_0': info['phi_0'],
+                'grad_norm': grad_norm,
+                'sigma2': sigma2,
+                'eval_count': self.eval_count,
+                'p_wolfe_history': info['p_wolfe_history'],
+                'armijo_history': info['armijo_history'],
+                'curvature_history': info['curvature_history'],
+                'ei_value_history': info['ei_value_history'],
+                'fallback_evals': info.get('fallback_evals', []),  
+                'theta_trajectory': info['theta_trajectory'],
+            }
+
 
         if (
             type(self.objective._func) is EnvironmentObjective
